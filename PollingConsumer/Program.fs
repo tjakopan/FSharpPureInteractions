@@ -1,149 +1,66 @@
 ﻿open System
+open PollingConsumer
 
-type PollDuration = PollDuration of TimeSpan
-type IdleDuration = IdleDuration of TimeSpan
-type HandleDuration = HandleDuration of TimeSpan
+let limit = TimeSpan.FromMinutes 1.
 
-type CycleDuration =
-  { PollDuration: PollDuration
-    HandleDuration: HandleDuration }
+let printOnEntry (timeAtEntry: DateTimeOffset) =
+  printfn "Started polling at %s." (timeAtEntry.ToString "T")
+  printfn ""
 
-type State<'msg> =
-  | ReadyState of CycleDuration list
-  | ReceivedMessageState of (CycleDuration list * PollDuration * 'msg)
-  | NoMessageState of (CycleDuration list * PollDuration)
-  | StoppedState of CycleDuration list
+let printOnExit timeAtEntry (durations: TimeSpan list) =
+  let stats = Statistics.calculateAverageAndStandardDeviation durations
+  let timeAtExit = DateTimeOffset.Now
+  let elapsed = timeAtExit - timeAtEntry
 
-type PollingInstruction<'msg, 'next> =
-  | CurrentTime of (DateTimeOffset -> 'next)
-  | Poll of ('msg option * PollDuration -> 'next)
-  | Handle of ('msg * (HandleDuration -> 'next))
-  | Idle of (IdleDuration * (IdleDuration -> 'next))
-
-let private mapI f =
-  function
-  | CurrentTime next -> CurrentTime(next >> f)
-  | Poll next -> Poll(next >> f)
-  | Handle(x, next) -> Handle(x, next >> f)
-  | Idle(x, next) -> Idle(x, next >> f)
-
-type PollingProgram<'msg, 'next> =
-  | Free of PollingInstruction<'msg, PollingProgram<'msg, 'next>>
-  | Pure of 'next
-
-let rec bind f =
-  function
-  | Free instruction -> instruction |> mapI (bind f) |> Free
-  | Pure x -> f x
-
-let map f = bind (f >> Pure)
-
-let currentTime = Free(CurrentTime Pure)
-let poll = Free(Poll Pure)
-let handle msg = Free(Handle(msg, Pure))
-let idle duration = Free(Idle(duration, Pure))
-
-type PollingBuilder() =
-  member this.Bind(x, f) = bind f x
-  member this.Return(x) = Pure x
-  member this.ReturnFrom(x) = x
-  member this.Zero() = Pure()
-
-let polling = PollingBuilder()
-
-let private shouldIdle (IdleDuration d) stopBefore =
-  polling {
-    let! now = currentTime
-    return now + d < stopBefore
-  }
-
-let toTotalCycleTimeSpan x =
-  let (PollDuration pd) = x.PollDuration
-  let (HandleDuration hd) = x.HandleDuration
-  pd + hd
-
-let calculateAverage (durations: TimeSpan list) =
-  if durations.IsEmpty then
-    None
-  else
-    durations
-    |> List.averageBy (fun x -> float x.Ticks)
-    |> int64
-    |> TimeSpan.FromTicks
-    |> Some
-
-let calculateAverageAndStandardDeviation durations =
-  let stdDev (avg: TimeSpan) =
-    durations
-    |> List.averageBy (fun x -> ((x - avg).Ticks |> float) ** 2.)
-    |> sqrt
-    |> int64
-    |> TimeSpan.FromTicks
-
-  durations |> calculateAverage |> Option.map (fun avg -> (avg, stdDev avg))
-
-let calculateExpectedDuration estimatedDuration durations =
-  match calculateAverageAndStandardDeviation durations with
-  | None -> estimatedDuration
-  | Some(avg, stdDev) -> avg + stdDev + stdDev + stdDev
-
-let private shouldPoll estimatedDuration stopBefore statistics =
-  polling {
-    let expectedHandleDuration =
-      statistics
-      |> List.map toTotalCycleTimeSpan
-      |> calculateExpectedDuration estimatedDuration
-
-    let! now = currentTime
-    return now + expectedHandleDuration < stopBefore
-  }
-
-let transitionFromStopped s = polling { return StoppedState s }
-
-let transitionFromReceived (statistics, pd, msg) =
-  polling {
-    let! hd = handle msg
-
-    return
-      { PollDuration = pd
-        HandleDuration = hd }
-      :: statistics
-      |> ReadyState
-  }
-
-let transitionFromNoMessage d stopBefore (statistics, _) =
-  polling {
-    let! b = shouldIdle d stopBefore
-
-    if b then
-      do! idle d |> map ignore
-      return ReadyState statistics
+  let durationColor =
+    if elapsed <= limit then
+      ConsoleColor.Green
     else
-      return StoppedState statistics
-  }
+      ConsoleColor.Red
 
-let transitionFromReady estimatedDuration stopBefore statistics =
-  polling {
-    let! b = shouldPoll estimatedDuration stopBefore statistics
+  printfn ""
+  printfn "Stopped polling at %s." (timeAtExit.ToString "T")
+  printf "Elapsed time: "
+  ColorPrint.cprintf durationColor "%s" (elapsed.ToString "c")
+  printfn "."
+  printfn $"Handled %d{durations.Length} message(s)."
 
-    if b then
-      let! pollResult = poll
+  stats
+  |> Option.map (fun (avg, stdDev) -> avg.ToString "T", stdDev.ToString "T")
+  |> Option.iter (fun (avg, stdDev) ->
+    printfn $"Average duration: %s{avg}"
+    printfn $"Standard deviation: %s{stdDev}")
 
-      match pollResult with
-      | Some msg, pd -> return ReceivedMessageState(statistics, pd, msg)
-      | None, pd -> return NoMessageState(statistics, pd)
-    else
-      return StoppedState statistics
-  }
-
-let transition estimatedDuration idleDuration stopBefore = function
-  | ReadyState s -> transitionFromReady estimatedDuration stopBefore s
-  | ReceivedMessageState s -> transitionFromReceived s
-  | NoMessageState s -> transitionFromNoMessage idleDuration stopBefore s
-  | StoppedState s -> transitionFromStopped s
-
-let rec interpret = function
+let rec interpret =
+  function
   | Pure x -> x
   | Free(CurrentTime next) -> DateTimeOffset.Now |> next |> interpret
-  | Free(Poll next) -> poll |> next |> interpret
-  
+  | Free(Poll next) -> Implementation.poll () |> next |> interpret
+  | Free(Handle(msg, next)) -> Implementation.handle msg |> next |> interpret
+  | Free(Idle(d, next)) -> Implementation.idle d |> next |> interpret
+
+let rec run estimatedDuration idleDuration stopBefore s =
+  let ns =
+    PollingConsumer.transition estimatedDuration idleDuration stopBefore s
+    |> interpret
+
+  match ns with
+  | PollingConsumer.StoppedState _ -> ns
+  | _ -> run estimatedDuration idleDuration stopBefore ns
+
+[<EntryPoint>]
+let main _ =
+  let timeAtEntry = DateTimeOffset.Now
+  printOnEntry timeAtEntry
+  let stopBefore = timeAtEntry + limit
+  let estimatedDuration = TimeSpan.FromSeconds 2.
+  let idleDuration = TimeSpan.FromSeconds 5. |> IdleDuration
+
+  let durations =
+    PollingConsumer.ReadyState []
+    |> run estimatedDuration idleDuration stopBefore
+    |> PollingConsumer.durations
+    |> List.map PollingConsumer.toTotalCycleTimeSpan
+
+  printOnExit timeAtEntry durations
+  0

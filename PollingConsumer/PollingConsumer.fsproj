@@ -7,6 +7,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="ColorPrint.fs" />
+    <Compile Include="Simulation.fs" />
+    <Compile Include="Polling.fs" />
+    <Compile Include="Implementation.fs" />
+    <Compile Include="Statistics.fs" />
+    <Compile Include="PollingConsumer.fs" />
     <Compile Include="Program.fs"/>
   </ItemGroup>
 
