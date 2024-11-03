@@ -1,0 +1,2 @@
+module PureTimes.ColorPrint
+
